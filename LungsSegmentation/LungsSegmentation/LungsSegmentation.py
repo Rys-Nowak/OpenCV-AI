@@ -1,13 +1,13 @@
 import pip
 import sys
 
-for module in ['scipy', 'scikit-image', 'opencv-python', 'numpy']:
-    if module in sys.modules:
+for module in ['scipy', 'scikit-image', 'opencv-python', 'numpy', "surface-distance"]:
+    if module not in sys.modules:
         pip.main(['install', module])
 
 import logging
 import os
-from typing import Annotated, Optional
+from typing import Optional
 
 import vtk
 
@@ -18,7 +18,6 @@ from slicer.ScriptedLoadableModule import *
 from slicer.util import VTKObservationMixin
 from slicer.parameterNodeWrapper import (
     parameterNodeWrapper,
-    WithinRange,
 )
 
 from slicer import vtkMRMLScalarVolumeNode
@@ -28,6 +27,7 @@ import cv2
 from skimage.segmentation import watershed
 from scipy import ndimage as ndi
 from skimage import filters
+import surface_distance
 
 #
 # LungsSegmentation
@@ -41,22 +41,12 @@ class LungsSegmentation(ScriptedLoadableModule):
 
     def __init__(self, parent):
         ScriptedLoadableModule.__init__(self, parent)
-        self.parent.title = _("LungsSegmentation")  # TODO: make this more human readable by adding spaces
-        # TODO: set categories (folders where the module shows up in the module selector)
-        self.parent.categories = [translate("qSlicerAbstractCoreModule", "Examples")]
-        self.parent.dependencies = []  # TODO: add here list of module names that this module requires
-        self.parent.contributors = ["Ryszard Nowak (AGH)", "Eryk Mikołajek (AGH)"]  # TODO: replace with "Firstname Lastname (Organization)"
-        # TODO: update with short description of the module and a link to online module documentation
-        # _() function marks text as translatable to other languages
-        self.parent.helpText = _("""
-This is an example of scripted loadable module bundled in an extension.
-See more information in <a href="https://github.com/organization/projectname#LungsSegmentation">module documentation</a>.
-""")
-        # TODO: replace with organization, grant and thanks
-        self.parent.acknowledgementText = _("""
-This file was originally developed by Jean-Christophe Fillion-Robin, Kitware Inc., Andras Lasso, PerkLab,
-and Steve Pieper, Isomics, Inc. and was partially funded by NIH grant 3P41RR013218-12S1.
-""")
+        self.parent.title = _("LungsSegmentation")
+        self.parent.categories = [translate("qSlicerAbstractCoreModule", "Segmentation")]
+        self.parent.dependencies = ['scipy', 'scikit-image', 'opencv-python', 'numpy', "surface-distance"]  # TODO: add here list of module names that this module requires
+        self.parent.contributors = ["Ryszard Nowak (AGH)", "Eryk Mikołajek (AGH)"]
+        self.parent.helpText = _("")
+        self.parent.acknowledgementText = _("")
 
         # Additional initialization step after application startup is complete
         slicer.app.connect("startupCompleted()", registerSampleData)
@@ -123,17 +113,12 @@ class LungsSegmentationParameterNode:
     The parameters needed by module.
 
     inputVolume - The volume to threshold.
-    imageThreshold - The value at which to threshold the input volume.
-    invertThreshold - If true, will invert the threshold.
-    thresholdedVolume - The output volume that will contain the thresholded volume.
-    invertedVolume - The output volume that will contain the inverted thresholded volume.
+    referenceVolume
     """
 
     inputVolume: vtkMRMLScalarVolumeNode
-    imageThreshold: Annotated[float, WithinRange(-100, 500)] = 100
-    invertThreshold: bool = False
+    referenceVolume: vtkMRMLScalarVolumeNode
     thresholdedVolume: vtkMRMLScalarVolumeNode
-    invertedVolume: vtkMRMLScalarVolumeNode
 
 
 #
@@ -226,6 +211,11 @@ class LungsSegmentationWidget(ScriptedLoadableModuleWidget, VTKObservationMixin)
             if firstVolumeNode:
                 self._parameterNode.inputVolume = firstVolumeNode
 
+        if not self._parameterNode.referenceVolume:
+            firstVolumeNode = slicer.mrmlScene.GetFirstNodeByName("vtkMRMLScalarVolumeNode")
+            if firstVolumeNode:
+                self._parameterNode.referenceVolume = firstVolumeNode
+
     def setParameterNode(self, inputParameterNode: Optional[LungsSegmentationParameterNode]) -> None:
         """
         Set and observe parameter node.
@@ -244,7 +234,7 @@ class LungsSegmentationWidget(ScriptedLoadableModuleWidget, VTKObservationMixin)
             self._checkCanApply()
 
     def _checkCanApply(self, caller=None, event=None) -> None:
-        if self._parameterNode and self._parameterNode.inputVolume and self._parameterNode.thresholdedVolume:
+        if self._parameterNode and self._parameterNode.inputVolume:
             self.ui.applyButton.toolTip = _("Compute output volume")
             self.ui.applyButton.enabled = True
         else:
@@ -255,14 +245,7 @@ class LungsSegmentationWidget(ScriptedLoadableModuleWidget, VTKObservationMixin)
         """Run processing when user clicks "Apply" button."""
         with slicer.util.tryWithErrorDisplay(_("Failed to compute results."), waitCursor=True):
             # Compute output
-            self.logic.process(self.ui.inputSelector.currentNode(), self.ui.outputSelector.currentNode(),
-                               self.ui.imageThresholdSliderWidget.value, self.ui.invertOutputCheckBox.checked)
-
-            # Compute inverted output (if needed)
-            if self.ui.invertedOutputSelector.currentNode():
-                # If additional output volume is selected then result with inverted threshold is written there
-                self.logic.process(self.ui.inputSelector.currentNode(), self.ui.invertedOutputSelector.currentNode(),
-                                   self.ui.imageThresholdSliderWidget.value, not self.ui.invertOutputCheckBox.checked, showResult=False)
+            self.logic.process(self.ui.inputSelector.currentNode(), self.ui.referenceSelector.currentNode())
 
 
 #
@@ -425,13 +408,13 @@ class LungsSegmentationLogic(ScriptedLoadableModuleLogic):
         lungs_processed = self.clear_bubbles(lungs_morphed)
         gradients, markers = self.create_markers_and_gradients(lungs_processed, lungs)
         return watershed(gradients, markers)
+    
+    def calculate_dice(self, pred, ref):
+        return surface_distance.compute_dice_coefficient(ref, pred)
 
     def process(self,
                 inputVolume: vtkMRMLScalarVolumeNode,
-                outputVolume: vtkMRMLScalarVolumeNode,
-                imageThreshold: float,
-                invert: bool = False,
-                showResult: bool = True) -> None:
+                referenceVolume: vtkMRMLScalarVolumeNode) -> None:
         """
         Run the processing algorithm.
         Can be used without GUI widget.
@@ -442,7 +425,7 @@ class LungsSegmentationLogic(ScriptedLoadableModuleLogic):
         :param showResult: show output volume in slice viewers
         """
 
-        if not inputVolume or not outputVolume:
+        if not inputVolume or not referenceVolume:
             raise ValueError("Input or output volume is invalid")
 
         import time
@@ -450,78 +433,12 @@ class LungsSegmentationLogic(ScriptedLoadableModuleLogic):
         startTime = time.time()
 
         logging.info("Processing started")
+        lungs_reference = slicer.util.arrayFromVolume(referenceVolume).T
         lungs_input = slicer.util.arrayFromVolume(inputVolume).T
         lungs_pred = self.predict_lungs(lungs_input)
         slicer.util.addVolumeFromArray(lungs_pred.T, name="Segmented lungs")
+        dice = self.calculate_dice(lungs_pred, lungs_reference)
+        logging.info(f"Dice coefficient: {dice}")
 
         stopTime = time.time()
         logging.info(f"Processing completed in {stopTime-startTime:.2f} seconds")
-
-
-#
-# LungsSegmentationTest
-#
-
-
-class LungsSegmentationTest(ScriptedLoadableModuleTest):
-    """
-    This is the test case for your scripted module.
-    Uses ScriptedLoadableModuleTest base class, available at:
-    https://github.com/Slicer/Slicer/blob/main/Base/Python/slicer/ScriptedLoadableModule.py
-    """
-
-    def setUp(self):
-        """Do whatever is needed to reset the state - typically a scene clear will be enough."""
-        slicer.mrmlScene.Clear()
-
-    def runTest(self):
-        """Run as few or as many tests as needed here."""
-        self.setUp()
-        self.test_LungsSegmentation1()
-
-    def test_LungsSegmentation1(self):
-        """Ideally you should have several levels of tests.  At the lowest level
-        tests should exercise the functionality of the logic with different inputs
-        (both valid and invalid).  At higher levels your tests should emulate the
-        way the user would interact with your code and confirm that it still works
-        the way you intended.
-        One of the most important features of the tests is that it should alert other
-        developers when their changes will have an impact on the behavior of your
-        module.  For example, if a developer removes a feature that you depend on,
-        your test should break so they know that the feature is needed.
-        """
-
-        self.delayDisplay("Starting the test")
-
-        # Get/create input data
-
-        import SampleData
-
-        registerSampleData()
-        inputVolume = SampleData.downloadSample("LungsSegmentation1")
-        self.delayDisplay("Loaded test data set")
-
-        inputScalarRange = inputVolume.GetImageData().GetScalarRange()
-        self.assertEqual(inputScalarRange[0], 0)
-        self.assertEqual(inputScalarRange[1], 695)
-
-        outputVolume = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLScalarVolumeNode")
-        threshold = 100
-
-        # Test the module logic
-
-        logic = LungsSegmentationLogic()
-
-        # Test algorithm with non-inverted threshold
-        logic.process(inputVolume, outputVolume, threshold, True)
-        outputScalarRange = outputVolume.GetImageData().GetScalarRange()
-        self.assertEqual(outputScalarRange[0], inputScalarRange[0])
-        self.assertEqual(outputScalarRange[1], threshold)
-
-        # Test algorithm with inverted threshold
-        logic.process(inputVolume, outputVolume, threshold, False)
-        outputScalarRange = outputVolume.GetImageData().GetScalarRange()
-        self.assertEqual(outputScalarRange[0], inputScalarRange[0])
-        self.assertEqual(outputScalarRange[1], inputScalarRange[1])
-
-        self.delayDisplay("Test passed")
