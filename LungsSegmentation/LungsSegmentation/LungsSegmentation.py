@@ -1,3 +1,10 @@
+import pip
+import sys
+
+for module in ['scipy', 'scikit-image', 'opencv-python', 'numpy']:
+    if module in sys.modules:
+        pip.main(['install', module])
+
 import logging
 import os
 from typing import Annotated, Optional
@@ -16,6 +23,11 @@ from slicer.parameterNodeWrapper import (
 
 from slicer import vtkMRMLScalarVolumeNode
 
+import numpy as np
+import cv2
+from skimage.segmentation import watershed
+from scipy import ndimage as ndi
+from skimage import filters
 
 #
 # LungsSegmentation
@@ -33,7 +45,7 @@ class LungsSegmentation(ScriptedLoadableModule):
         # TODO: set categories (folders where the module shows up in the module selector)
         self.parent.categories = [translate("qSlicerAbstractCoreModule", "Examples")]
         self.parent.dependencies = []  # TODO: add here list of module names that this module requires
-        self.parent.contributors = ["John Doe (AnyWare Corp.)"]  # TODO: replace with "Firstname Lastname (Organization)"
+        self.parent.contributors = ["Ryszard Nowak (AGH)", "Eryk Mikołajek (AGH)"]  # TODO: replace with "Firstname Lastname (Organization)"
         # TODO: update with short description of the module and a link to online module documentation
         # _() function marks text as translatable to other languages
         self.parent.helpText = _("""
@@ -274,6 +286,145 @@ class LungsSegmentationLogic(ScriptedLoadableModuleLogic):
 
     def getParameterNode(self):
         return LungsSegmentationParameterNode(super().getParameterNode())
+    
+    def reconstruct(self, marker: np.ndarray, mask: np.ndarray, radius: int = 1):
+        kernel = np.ones(shape=(radius * 2 + 1,) * 2, dtype=np.uint8)
+        while True:
+            expanded = cv2.dilate(src=marker, kernel=kernel)
+            cv2.bitwise_and(src1=expanded, src2=mask, dst=expanded)
+            if (marker == expanded).all():
+                return expanded
+            
+            marker = expanded
+
+    def binarize(self, lungs, max_val):
+        lungs_bin_inv = np.zeros(lungs.T.shape)
+        for i, dim in enumerate(lungs.T):
+            _, lungs_bin_inv[i] = cv2.threshold(dim, -320, max_val, cv2.THRESH_BINARY_INV)
+
+        lungs_bin_inv = lungs_bin_inv.T
+        return lungs_bin_inv
+
+    def predict_bodymask(self, lungs, max_val):
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        bodymask_pred = np.zeros(lungs.T.shape)
+        for i, dim in enumerate(lungs.T):
+            _, bin = cv2.threshold(dim, -200, max_val, cv2.THRESH_BINARY)
+            img = cv2.erode(bin, kernel, iterations=1)
+            img = cv2.dilate(img, kernel, iterations=1)
+            img_neg = np.logical_not(img).astype(np.uint8)
+            border_marker = np.zeros(img.shape)
+            border_marker[0] = 1
+            border_marker[-1] = 1
+            border_marker[:, 0] = 1
+            border_marker[:, -1] = 1
+            border_marker = np.logical_and(img_neg, border_marker).astype(np.uint8)
+            reconstructed = self.reconstruct(border_marker, img_neg)
+            cleared_border = img_neg - reconstructed
+            filled_img = np.logical_or(cleared_border, img).astype(np.uint8)
+            bodymask_pred[i] = filled_img
+
+        bodymask_pred = bodymask_pred.T.astype(bool)
+        return self.clear_bubbles(bodymask_pred).astype(bool)
+
+    def perform_morphological(self, lungs_air_within_body):
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        lungs_morphed = np.zeros(lungs_air_within_body.T.shape)
+        for i, dim in enumerate(lungs_air_within_body.T):
+            lungs_morphed[i] = cv2.medianBlur(dim, 7)
+
+        lungs_morphed = lungs_morphed.T
+        lungs_morphed = cv2.dilate(lungs_morphed, kernel, None, iterations=2)
+        lungs_morphed = cv2.erode(lungs_morphed, kernel, None, iterations=2)
+        lungs_morphed = cv2.erode(lungs_morphed, kernel, None, iterations=2)
+        lungs_morphed = cv2.dilate(lungs_morphed, kernel, None, iterations=2)
+        return lungs_morphed
+
+    def clear_bubbles(self, lungs_morphed):
+        lungs_processed = np.zeros(lungs_morphed.T.shape)
+        for i, dim in enumerate(lungs_morphed.T):
+            num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(dim.astype(np.uint8))
+            for j in range(num_labels):
+                if stats[j][cv2.CC_STAT_AREA] < 500:
+                    labels[labels == j] = 0
+
+            lungs_processed[i] = labels
+
+        for i, dim in enumerate(lungs_processed):
+            _, lungs_processed[i] = cv2.threshold(dim, 0, 255, cv2.THRESH_BINARY)
+
+        lungs_processed = lungs_processed.T.astype(np.uint8)
+        return lungs_processed
+
+    def create_markers_and_gradients(self, lungs_processed, lungs):
+        boundaries = np.zeros(lungs_processed.T.shape)
+        gradients = np.zeros(lungs_processed.T.shape)
+        sure_fg_3D = np.zeros(lungs_processed.T.shape)
+        for i, (processed_img, org_img) in enumerate(zip(lungs_processed.T, lungs.T)):
+            gradients[i] = filters.sobel(org_img)
+            distance = ndi.distance_transform_edt(processed_img)
+            _, sure_fg = cv2.threshold(distance, 0.4*distance.max(), 255, 0)
+            sure_fg = sure_fg.astype(np.uint8)
+            # sure_fg = cv2.erode(processed_img, np.ones((15, 15)), iterations=3).astype(np.uint8)
+            sure_bg = cv2.dilate(processed_img, np.ones((7, 7)), iterations=3).astype(np.uint8)
+            boundaries[i] = cv2.subtract(sure_bg, sure_fg)
+            sure_fg_3D[i] = sure_fg
+
+        boundaries = boundaries.T
+        sure_fg_3D = sure_fg_3D.T
+        markers, num_labels = ndi.label(sure_fg_3D)
+        markers += 1
+        markers[boundaries == 255] = 0
+        labels_sums = np.zeros(num_labels)
+        for i in range(num_labels):
+            labels_sums[i] = np.sum((markers==i)*1)
+
+        top_arg =  np.argmax(labels_sums)
+        trimmed_labels = np.zeros(markers.shape)
+        trimmed_labels += (markers == top_arg) * 1 # background
+        for i in range(1, 4):
+            labels_sums[top_arg] = 0
+            top_arg = np.argmax(labels_sums)
+            if top_arg != 0: # not border marker
+                trimmed_labels += (markers == top_arg) * i
+
+        markers = trimmed_labels.astype(np.int32)
+        gradients /= np.max(gradients)
+        gradients *= 255
+        gradients = gradients.T.astype(np.int32)
+        return gradients,markers
+
+    def get_lungs_masks(self, lungs_test, lungs_done):
+        left_lung_index = -1
+        for slice in lungs_done:
+            if np.isin(2, slice) and np.isin(3, slice):
+                for row in slice:
+                    if np.isin(2, row):
+                        left_lung_index = 2
+                        break
+                    elif np.isin(3, row):
+                        left_lung_index = 3
+                        break
+            
+            if left_lung_index != -1:
+                break
+        
+        assert left_lung_index == 2 or left_lung_index == 3
+        left_lung_pred = lungs_done == left_lung_index
+        right_lung_pred = lungs_done == (3 if left_lung_index == 2 else 2)
+        left_lung_gt = lungs_test == 2
+        right_lung_gt = lungs_test == 3
+        return left_lung_pred,right_lung_pred,left_lung_gt,right_lung_gt
+
+    def predict_lungs(self, lungs):
+        max_val = np.max(lungs)
+        lungs_bin_inv = self.binarize(lungs, max_val)
+        bodymask_pred = self.predict_bodymask(lungs, max_val)
+        lungs_air_within_body = np.logical_and(lungs_bin_inv, bodymask_pred).astype(np.uint8)
+        lungs_morphed = self.perform_morphological(lungs_air_within_body)
+        lungs_processed = self.clear_bubbles(lungs_morphed)
+        gradients, markers = self.create_markers_and_gradients(lungs_processed, lungs)
+        return watershed(gradients, markers)
 
     def process(self,
                 inputVolume: vtkMRMLScalarVolumeNode,
@@ -297,18 +448,11 @@ class LungsSegmentationLogic(ScriptedLoadableModuleLogic):
         import time
 
         startTime = time.time()
-        logging.info("Processing started")
 
-        # Compute the thresholded output volume using the "Threshold Scalar Volume" CLI module
-        cliParams = {
-            "InputVolume": inputVolume.GetID(),
-            "OutputVolume": outputVolume.GetID(),
-            "ThresholdValue": imageThreshold,
-            "ThresholdType": "Above" if invert else "Below",
-        }
-        cliNode = slicer.cli.run(slicer.modules.thresholdscalarvolume, None, cliParams, wait_for_completion=True, update_display=showResult)
-        # We don't need the CLI module node anymore, remove it to not clutter the scene with it
-        slicer.mrmlScene.RemoveNode(cliNode)
+        logging.info("Processing started")
+        lungs_input = slicer.util.arrayFromVolume(inputVolume).T
+        lungs_pred = self.predict_lungs(lungs_input)
+        slicer.util.addVolumeFromArray(lungs_pred.T, name="Segmented lungs")
 
         stopTime = time.time()
         logging.info(f"Processing completed in {stopTime-startTime:.2f} seconds")
