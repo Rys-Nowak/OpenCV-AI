@@ -386,7 +386,8 @@ class LungsSegmentationLogic(ScriptedLoadableModuleLogic):
         lungs_reference = np.logical_or.reduce(segmentsArrays).astype(np.uint8)
         slicer.util.addVolumeFromArray(lungs_reference.T, name="Reference lungs binary")
         lungs_input = slicer.util.arrayFromVolume(inputVolume).T
-        lungs_pred = self.predict_lungs(lungs_input).astype(bool).astype(np.uint8)
+        lungs_pred = self.predict_lungs(lungs_input)
+        lungs_pred = (lungs_pred != 1).astype(np.uint8)
         slicer.util.addVolumeFromArray(lungs_pred.T, name="Segmented lungs")
         dice = self.calculate_dice(lungs_pred, lungs_reference)
         logging.info(f"Dice coefficient: {dice}")
