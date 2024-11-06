@@ -19,7 +19,7 @@ from slicer.parameterNodeWrapper import (
     parameterNodeWrapper,
 )
 
-from slicer import vtkMRMLScalarVolumeNode
+from slicer import vtkMRMLScalarVolumeNode, vtkMRMLSegmentationNode
 
 import numpy as np
 import cv2
@@ -63,7 +63,7 @@ class LungsSegmentationParameterNode:
     """
 
     inputVolume: vtkMRMLScalarVolumeNode
-    referenceVolume: vtkMRMLScalarVolumeNode
+    referenceVolume: vtkMRMLSegmentationNode
 
 
 #
@@ -157,9 +157,9 @@ class LungsSegmentationWidget(ScriptedLoadableModuleWidget, VTKObservationMixin)
                 self._parameterNode.inputVolume = firstVolumeNode
 
         if not self._parameterNode.referenceVolume:
-            firstVolumeNode = slicer.mrmlScene.GetFirstNodeByName("vtkMRMLScalarVolumeNode")
-            if firstVolumeNode:
-                self._parameterNode.referenceVolume = firstVolumeNode
+            firstSegNode = slicer.mrmlScene.GetFirstNodeByName("vtkMRMLSegmentationNode")
+            if firstSegNode:
+                self._parameterNode.referenceVolume = firstSegNode
 
     def setParameterNode(self, inputParameterNode: Optional[LungsSegmentationParameterNode]) -> None:
         """
@@ -359,7 +359,7 @@ class LungsSegmentationLogic(ScriptedLoadableModuleLogic):
 
     def process(self,
                 inputVolume: vtkMRMLScalarVolumeNode,
-                referenceVolume: vtkMRMLScalarVolumeNode) -> None:
+                referenceVolume: vtkMRMLSegmentationNode) -> None:
         """
         Run the processing algorithm.
         Can be used without GUI widget.
@@ -375,10 +375,21 @@ class LungsSegmentationLogic(ScriptedLoadableModuleLogic):
         startTime = time.time()
 
         logging.info("Processing started")
-        lungs_reference = slicer.util.arrayFromVolume(referenceVolume).T
+        segmentIds = [
+            referenceVolume.GetSegmentation().GetSegmentIdBySegmentName("superior lobe of left lung"),
+            referenceVolume.GetSegmentation().GetSegmentIdBySegmentName("inferior lobe of left lung"),
+            referenceVolume.GetSegmentation().GetSegmentIdBySegmentName("superior lobe of right lung"),
+            referenceVolume.GetSegmentation().GetSegmentIdBySegmentName("middle lobe of right lung"),
+            referenceVolume.GetSegmentation().GetSegmentIdBySegmentName("inferior lobe of right lung")
+        ]
+        segmentsArrays = [slicer.util.arrayFromSegment(referenceVolume, id).T for id in segmentIds]
+        lungs_reference = np.logical_or.reduce(segmentsArrays).astype(np.uint8)
+        slicer.util.addVolumeFromArray(lungs_reference.T, name="Reference lungs binary")
         lungs_input = slicer.util.arrayFromVolume(inputVolume).T
-        lungs_pred = self.predict_lungs(lungs_input)
+        lungs_pred = self.predict_lungs(lungs_input).astype(np.uint8)
         slicer.util.addVolumeFromArray(lungs_pred.T, name="Segmented lungs")
+        print(lungs_pred.shape)
+        print(lungs_reference.shape)
         dice = self.calculate_dice(lungs_pred, lungs_reference)
         logging.info(f"Dice coefficient: {dice}")
 
