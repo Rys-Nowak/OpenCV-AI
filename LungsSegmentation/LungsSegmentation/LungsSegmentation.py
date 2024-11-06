@@ -63,6 +63,7 @@ class LungsSegmentationParameterNode:
     """
 
     inputVolume: vtkMRMLScalarVolumeNode
+    gtVolume: vtkMRMLScalarVolumeNode
     referenceVolume: vtkMRMLSegmentationNode
 
 
@@ -190,7 +191,7 @@ class LungsSegmentationWidget(ScriptedLoadableModuleWidget, VTKObservationMixin)
         """Run processing when user clicks "Apply" button."""
         with slicer.util.tryWithErrorDisplay(_("Failed to compute results."), waitCursor=True):
             # Compute output
-            self.logic.process(self.ui.inputSelector.currentNode(), self.ui.referenceSelector.currentNode())
+            self.logic.process(self.ui.inputSelector.currentNode(), self.ui.gtSelector.currentNode(), self.ui.referenceSelector.currentNode())
 
 
 #
@@ -359,6 +360,7 @@ class LungsSegmentationLogic(ScriptedLoadableModuleLogic):
 
     def process(self,
                 inputVolume: vtkMRMLScalarVolumeNode,
+                gtVolume: vtkMRMLScalarVolumeNode,
                 referenceVolume: vtkMRMLSegmentationNode) -> None:
         """
         Run the processing algorithm.
@@ -367,7 +369,7 @@ class LungsSegmentationLogic(ScriptedLoadableModuleLogic):
         :param referenceVolume
         """
 
-        if not inputVolume or not referenceVolume:
+        if not inputVolume or not referenceVolume or not gtVolume:
             raise ValueError("Input or output volume is invalid")
 
         import time
@@ -375,6 +377,7 @@ class LungsSegmentationLogic(ScriptedLoadableModuleLogic):
         startTime = time.time()
 
         logging.info("Processing started")
+        lungs_gt = slicer.util.arrayFromVolume(gtVolume).T.astype(bool).astype(np.uint8)
         segmentIds = [
             referenceVolume.GetSegmentation().GetSegmentIdBySegmentName("superior lobe of left lung"),
             referenceVolume.GetSegmentation().GetSegmentIdBySegmentName("inferior lobe of left lung"),
@@ -383,14 +386,16 @@ class LungsSegmentationLogic(ScriptedLoadableModuleLogic):
             referenceVolume.GetSegmentation().GetSegmentIdBySegmentName("inferior lobe of right lung")
         ]
         segmentsArrays = [slicer.util.arrayFromSegment(referenceVolume, id).T for id in segmentIds]
-        lungs_reference = np.logical_or.reduce(segmentsArrays).astype(np.uint8)
-        slicer.util.addVolumeFromArray(lungs_reference.T, name="Reference lungs binary")
+        lungs_total_seg = np.logical_or.reduce(segmentsArrays).astype(np.uint8)
+        slicer.util.addVolumeFromArray(lungs_total_seg.T, name="Reference lungs binary")
         lungs_input = slicer.util.arrayFromVolume(inputVolume).T
         lungs_pred = self.predict_lungs(lungs_input)
         lungs_pred = (lungs_pred != 1).astype(np.uint8)
         slicer.util.addVolumeFromArray(lungs_pred.T, name="Segmented lungs")
-        dice = self.calculate_dice(lungs_pred, lungs_reference)
-        logging.info(f"Dice coefficient: {dice}")
+        dice_total_seg = self.calculate_dice(lungs_total_seg, lungs_gt)
+        dice_pred = self.calculate_dice(lungs_pred, lungs_gt)
+        logging.info(f"Dice coefficient for reference segmentator: {dice_total_seg}")
+        logging.info(f"Dice coefficient for our model: {dice_pred}")
 
         stopTime = time.time()
         logging.info(f"Processing completed in {stopTime-startTime:.2f} seconds")
